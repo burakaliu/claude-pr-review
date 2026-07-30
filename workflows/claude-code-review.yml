@@ -1,0 +1,64 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+# One review at a time per PR. Pushing again cancels the run it supersedes.
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  claude-review:
+    # Skip drafts. The ready_for_review trigger reviews them once marked ready.
+    # Skip bot-authored PRs (dependabot and friends). The action refuses to run
+    # for non-human actors anyway, and it can burn 15 minutes of runner time
+    # before it notices.
+    if: >-
+      !github.event.pull_request.draft &&
+      github.event.pull_request.user.type != 'Bot'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # inline review comments + the summary comment
+      issues: write # fallback comments through the issues API
+      id-token: write
+      actions: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Full history so the review can diff against the base branch locally.
+          fetch-depth: 0
+
+      - name: Run Claude Code Review
+        id: claude-review
+        uses: anthropics/claude-code-action@v1
+        with:
+          # Swap for `anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}` if you
+          # bill through the API instead of a Claude subscription.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            Perform an in-depth code review of pull request #${{ github.event.pull_request.number }} in ${{ github.repository }} (head commit ${{ github.event.pull_request.head.sha }}).
+
+            <<< REPLACE: 2 to 4 lines naming your stack, then point at your docs. See PROMPT.md. >>>
+            This is a <language + framework + runtime> service, backed by <database>, deployed on <host>. Read `CLAUDE.md` at the repo root first. It documents the architecture, conventions, and constraints this code must honor.
+            <<< END REPLACE >>>
+
+            Process:
+            1. Read the PR title and description, then the full diff (`gh pr diff ${{ github.event.pull_request.number }}`), then open every changed file in the checkout and enough surrounding code (call sites, handlers, migrations, related tests) to judge each change in context. Never review a hunk in isolation.
+            2. Hunt across ALL of these dimensions: correctness bugs and race conditions; edge cases and error handling; security issues; performance problems; API and contract regressions; test coverage gaps and test quality; readability, naming, and maintainability; simpler or more idiomatic alternatives.
+            3. Pay extra attention to the failure modes this codebase has actually hit: <<< REPLACE with your own list. This is the highest-value line in the file. See PROMPT.md. >>>
+            4. Verify every finding against the actual code before reporting it. Only report issues you have confirmed. No speculation about code you have not read.
+
+            Reporting:
+            - Post each finding as its own inline review comment anchored to the relevant file and line of the diff, with the first line prefixed by a severity tag: **[critical]**, **[major]**, **[minor]**, or **[improvement]**.
+            - Each comment must be self-contained: what is wrong, the concrete failure scenario or cost, and a specific suggested fix. Use suggestion blocks only when you are certain of the exact replacement text.
+            - Cover the full severity range. Include minor issues and potential improvements, not just high-confidence bugs. But never pad: if an area of the diff is clean, do not invent findings for it.
+            - Finish with ONE summary comment on the PR: a short overall assessment plus a severity-ordered index of the inline findings.
+            - Comments only: do not approve, do not request changes, do not push commits, and do not edit the PR description.
+          claude_args: |
+            --model claude-opus-5
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,mcp__github_comment__update_claude_comment,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr checks:*),Bash(gh pr comment:*),Bash(gh pr review:*),Bash(gh api:*)"
