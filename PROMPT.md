@@ -1,14 +1,24 @@
 # Tuning the prompt
 
-The prompt in `claude-code-review.yml` ships with two `<<< REPLACE >>>` markers. The generic
-version works. The version with six lines about your repo works much better, and it is the whole
-difference between a reviewer you keep and one you turn off after a week.
+Two things about your repo go into the prompt. The generic version works. The version with six
+lines about your repo works much better, and it is the whole difference between a reviewer you
+keep and one you turn off after a week.
 
 A general-purpose reviewer already knows how to find null derefs, missing awaits, and unhandled
 errors. What it cannot guess is which mistakes your team keeps making. That is what you are
 supplying.
 
-## Marker 1: what this repo is
+Where you put them depends on how you run it:
+
+| | Local | Actions |
+|---|---|---|
+| what this repo is | `stack` in `config.json` | first `<<< REPLACE >>>` in `claude-code-review.yml` |
+| failure modes | `watch_for` in `config.json` | second `<<< REPLACE >>>` |
+
+Local takes `watch_for` as a list of strings and formats it for you. The Actions version takes one
+prose sentence. The advice below is the same for both.
+
+## Part 1: what this repo is
 
 Two to four lines. Name the stack and point at your docs.
 
@@ -24,9 +34,9 @@ citing your own conventions back at you.
 
 If you have no such file, write one before you tune this prompt. It pays off twice.
 
-## Marker 2: the failure modes you have actually hit
+## Part 2: the failure modes you have actually hit
 
-This is the highest-value line in the file. Be specific. Name the real thing, not the category.
+This is the highest-value field. Be specific. Name the real thing, not the category.
 
 Weak:
 
@@ -81,7 +91,14 @@ The first stops it from reporting only the one obvious bug. The second stops it 
 filler for a clean file. Keep both or the balance tips.
 
 **"Comments only: do not approve, do not request changes, do not push commits."** This is what
-keeps it out of your merge path. A reviewer that can block merges becomes something you fight.
+keeps it out of your merge path. A reviewer that can block merges becomes something you fight. The
+local version enforces this twice: the prompt says it, and the script posts with `event: COMMENT`
+regardless of what the model asked for.
+
+**The output contract, local only.** `local/review-prompt.md` ends with a JSON schema and the rule
+that `line` must be a line the diff touches. The script reads that file and does the posting. If
+you loosen the anchoring rule, GitHub starts rejecting comments and they fall back to being posted
+one at a time, which is slower and drops the ones that miss.
 
 **The severity tags.** `[critical]`, `[major]`, `[minor]`, `[improvement]`. Tagging held at 99.8%
 across 640 comments in the sample, so you can filter and triage on them reliably. Pick different

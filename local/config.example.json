@@ -1,0 +1,31 @@
+{
+  "model": "claude-opus-5",
+  "max_reviews_per_run": 2,
+  "timeout_seconds": 2700,
+  "seed_only": false,
+
+  "repos": [
+    {
+      "repo": "OWNER/REPO",
+      "enabled": false,
+      "stack": "This is a <language + framework + runtime> service, backed by <database>, deployed on <host>.",
+      "watch_for": [
+        "Replace these with failure modes this repo has actually hit.",
+        "Three or four specific entries beat twenty generic ones.",
+        "This is the highest-value field in the file. See PROMPT.md."
+      ]
+    },
+
+    {
+      "repo": "acme/billing-api",
+      "enabled": false,
+      "stack": "This is an Express and TypeScript backend, backed by Supabase Postgres, with Stripe for billing and Zod for request validation. It deploys on Fly.io.",
+      "watch_for": [
+        "Routes that read a resource by id without checking the caller owns it.",
+        "Supabase queries that bypass row level security by using the service role key on a user-facing path.",
+        "Stripe webhook handlers that are not idempotent, so a retried event double-charges.",
+        "Duration constants named in one unit but computed in another, such as a millisecond name holding seconds."
+      ]
+    }
+  ]
+}

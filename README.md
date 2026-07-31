@@ -6,14 +6,20 @@ Then it posts one summary comment with an index of what it found.
 
 It never approves and never requests changes, so it cannot block a merge. It only comments.
 
-Two workflow files:
+## Two ways to run it
 
-| File | Trigger | What it does |
-|---|---|---|
-| `claude-code-review.yml` | every non-draft PR | full review, unprompted |
-| `claude.yml` | `@claude` in a comment | answers questions, on demand |
+| | Runs on | GitHub Actions minutes | Setup |
+|---|---|---|---|
+| **[Local](#local-setup)** | your Mac, on a timer | none | one config file, one installer |
+| **[Actions](#actions-setup)** | GitHub-hosted runners | billed on private repos | copy two workflow files in |
 
-You need a Claude subscription (Pro, Max, Team, or Enterprise) or an Anthropic API key.
+Start local if your repos are private. A 9 minute median review against a 2,000 minute monthly
+quota runs out faster than you expect, and the failure is silent: jobs stop starting and finish in
+3 seconds with no steps, which does not look like a quota problem until you check.
+
+Public repos get unlimited free Actions minutes, so the Actions path is the easier choice there.
+
+Either way you need a Claude subscription (Pro, Max, Team, or Enterprise) or an Anthropic API key.
 
 ## What the output looks like
 
@@ -54,50 +60,148 @@ Read the honest version of that table too. Most of the output is minor and impro
 Major and critical together are 13% of findings. That 13% is where the value is, and the severity
 tags exist so you can skim the rest.
 
-## Setup
+## Local setup
 
-Six steps. Step 5 is the one people get wrong.
+Needs macOS, plus `gh`, `jq`, `git`, `perl`, and the `claude` CLI on your PATH. Log in first with
+`gh auth login` and `claude` (or `claude setup-token`).
+
+### 1. Install
+
+```bash
+./local/install.sh
+```
+
+That writes a starter config to `~/.config/claude-pr-review/config.json`, registers a launchd
+agent, and starts it. It wakes every 5 minutes. Set `POLL_SECONDS=900 ./local/install.sh` for a
+different interval.
+
+Every repo in the starter config ships disabled, so nothing runs until you edit it.
+
+### 2. Fill in the config
+
+```json
+{
+  "model": "claude-opus-5",
+  "max_reviews_per_run": 2,
+  "timeout_seconds": 2700,
+  "seed_only": false,
+
+  "repos": [
+    {
+      "repo": "acme/billing-api",
+      "enabled": true,
+      "stack": "This is an Express and TypeScript backend, backed by Supabase Postgres, with Stripe for billing and Zod for request validation.",
+      "watch_for": [
+        "Routes that read a resource by id without checking the caller owns it.",
+        "Stripe webhook handlers that are not idempotent, so a retried event double-charges."
+      ]
+    }
+  ]
+}
+```
+
+`stack` and `watch_for` are what separate a generic review from a good one. `watch_for` is the
+higher-value field of the two: it is where you name the mistakes this repo keeps making. See
+[PROMPT.md](PROMPT.md).
+
+The top-level knobs:
+
+| Key | Default | What it does |
+|---|---|---|
+| `model` | `claude-opus-5` | a smaller model works and finds less |
+| `max_reviews_per_run` | `2` | ceiling per wake-up, so a backlog cannot stampede |
+| `timeout_seconds` | `2700` | kills a review that hangs |
+| `seed_only` | `false` | record open PRs without reviewing them, to start from a clean slate |
+
+### 3. Check it before trusting it
+
+Review one PR and print the result without posting anything:
+
+```bash
+./local/review-daemon.sh --dry-run --pr OWNER/REPO#42
+```
+
+Then watch the real thing:
+
+```bash
+tail -f ~/.local/state/claude-pr-review/daemon.log
+```
+
+### Turning it off
+
+```bash
+./local/uninstall.sh
+```
+
+Add `--purge` to delete the config, state, and cached clones too.
+
+## How the local version works
+
+**Polling.** Every wake-up it calls `gh pr list` on each enabled repo, skipping drafts and
+bot-authored PRs. Dependabot never gets reviewed, which matters: five open dependabot PRs would
+otherwise be five full reviews.
+
+**What counts as needing review.** It stores the last reviewed head commit per PR in
+`~/.local/state/claude-pr-review/reviewed.json`. A PR is reviewed when that commit does not match
+the current head, so a new push gets a fresh review and an untouched PR is left alone.
+
+**Checkout.** One blobless clone per repo under `~/.cache/claude-pr-review`, fetched and parked on
+the PR head. Claude runs with that as its working directory, so it can open any file in the repo,
+not only the diff.
+
+**Posting.** Claude writes its findings to a JSON file. The script posts them as one review
+containing every inline comment plus the summary. If GitHub rejects the batch, usually because a
+comment is anchored to a line outside the diff, it falls back to posting comments one at a time,
+keeps the ones that land, and always posts the summary.
+
+**Overlap.** launchd fires on a fixed interval and a review can outlast it. A lock makes the
+second run a no-op rather than a duplicate review.
+
+**Sleep.** Nothing runs while the Mac is asleep. It catches up on the next wake-up, and because
+state is keyed on head commit it reviews the current code rather than replaying what it missed.
+
+**Runtime.** Budget more than the Actions numbers above. A large PR took 22 minutes locally
+against a 9 minute median on hosted runners, so `timeout_seconds` defaults to 45 minutes. Raise it
+before you lower it: a review killed by the timeout writes nothing and gets retried on the next
+pass, which costs more than letting it finish.
+
+**Cost.** Reviews draw against your normal Claude usage, same as CLI work. GitHub is not involved
+and bills nothing.
+
+## Actions setup
+
+The workflow files still work and are still the right choice for public repos.
+
+| File | Trigger | What it does |
+|---|---|---|
+| `claude-code-review.yml` | every non-draft PR | full review, unprompted |
+| `claude.yml` | `@claude` in a comment | answers questions, on demand |
 
 ### 1. Get a token
-
-If you have a Claude subscription, run this in the Claude Code CLI:
 
 ```bash
 claude setup-token
 ```
 
 It opens a browser, you authorize, and it prints a token good for one year. Usage counts against
-your subscription.
-
-If you bill through the API instead, create a key at [platform.claude.com](https://platform.claude.com).
+your subscription. If you bill through the API instead, create a key at
+[platform.claude.com](https://platform.claude.com).
 
 ### 2. Add it as a repository secret
-
-For a subscription token:
 
 ```bash
 gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo OWNER/REPO
 ```
 
-For an API key:
-
-```bash
-gh secret set ANTHROPIC_API_KEY --repo OWNER/REPO
-```
-
-If you use the API key, change the `with:` line in `claude-code-review.yml` to
-`anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}`.
+For an API key, set `ANTHROPIC_API_KEY` instead and change the `with:` line in
+`claude-code-review.yml` to `anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}`.
 
 ### 3. Install the GitHub App
 
 Install [github.com/apps/claude](https://github.com/apps/claude) on the repo. It needs read and
 write on contents, issues, and pull requests. You need admin on the repo to install it.
 
-The Claude Code CLI can walk you through steps 1 to 3 in one go:
-
-```
-/install-github-app
-```
+The Claude Code CLI can walk you through steps 1 to 3 in one go with `/install-github-app`.
 
 ### 4. Copy the workflows in
 
@@ -105,8 +209,8 @@ The Claude Code CLI can walk you through steps 1 to 3 in one go:
 cp workflows/claude-code-review.yml workflows/claude.yml /path/to/your/repo/.github/workflows/
 ```
 
-Then edit the prompt in `claude-code-review.yml`. It has two `<<< REPLACE >>>` markers.
-Filling them in is what separates a generic review from a good one. See [PROMPT.md](PROMPT.md).
+Then edit the prompt in `claude-code-review.yml`. It has two `<<< REPLACE >>>` markers. Filling
+them in is what separates a generic review from a good one. See [PROMPT.md](PROMPT.md).
 
 Pushing workflow files needs the `workflow` scope on your gh token.
 
@@ -131,51 +235,45 @@ review is missing, grep the run log:
 gh run view RUN_ID --log | grep -i "workflow validation"
 ```
 
-More failure modes in [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
-
-## How it is wired
+### How the Actions version is wired
 
 **Triggers.** `opened`, `synchronize`, `ready_for_review`, `reopened`. `synchronize` means every
 push to an open PR gets a fresh review, which is the behavior you want and also the main cost
-driver. Drop it if reviews get noisy.
+driver.
 
 **Concurrency.** One review per PR at a time, `cancel-in-progress: true`. Push three times in a
-minute and you pay for one review, not three. Cancelled runs showed up 14 times in the sample,
-each one money saved.
+minute and you pay for one review, not three. Cancelled runs showed up 14 times in the sample.
 
-**Drafts and bots.** The `if:` condition skips draft PRs and skips PRs opened by bots. The action
-rejects non-human actors on its own, but not before burning runner time. Two dependabot PRs in
-the sample ran 12 and 18 minutes before hitting that check.
+**Drafts and bots.** The `if:` condition skips draft PRs and PRs opened by bots. The action rejects
+non-human actors on its own, but not before burning runner time. Two dependabot PRs in the sample
+ran 12 and 18 minutes before hitting that check.
 
 **Permissions.** `contents: read` and no write access beyond comments. The reviewer cannot push,
 and the prompt tells it not to try.
 
-**Model.** `--model claude-opus-5`. A cheaper model works and finds less. This is a judgment call
-about what a missed bug costs you.
-
 **Version pinning.** `anthropics/claude-code-action@v1` is a moving tag. It picks up patches
 automatically. Pin to an exact release if you want the workflow frozen.
 
-## Cost
+### A note on runner minutes
 
-On a subscription token, reviews draw against your normal Claude usage, same as CLI work. On an
-API key, you pay per token. Either way the shape is: one full-context read of the diff plus the
-files around it, per push, on an Opus-class model. That is not cheap per PR.
+Private repos draw from your account's monthly Actions quota. Public repos are unlimited and free.
 
-Three levers if it costs too much:
-
-1. Drop `synchronize` so it reviews once at open instead of on every push.
-2. Narrow `on.pull_request.branches` to the branches you actually care about.
-3. Move to a smaller model in `claude_args`.
-
-GitHub Actions runner minutes are billed separately by GitHub. At a 9 minute median, that adds up
-on private repos.
+Self-hosted runners are a third option: keep the workflows and change `runs-on: ubuntu-latest` to
+`runs-on: self-hosted`. GitHub bills no minutes for those today. It announced a per-minute charge
+for self-hosted runners on private repos starting March 2026, then postponed it. Worth knowing
+before you build on it. Personal accounts also register runners per repository, so three repos
+means three runner services.
 
 ## Files
 
 ```
-workflows/claude-code-review.yml   the reviewer
-workflows/claude.yml               the @claude mention agent
+local/review-daemon.sh             the poller and reviewer
+local/review-prompt.md             the prompt it runs, with placeholders
+local/config.example.json          starter config
+local/install.sh                   launchd agent installer
+local/uninstall.sh                 removes it
+workflows/claude-code-review.yml   the reviewer, on Actions
+workflows/claude.yml               the @claude mention agent, on Actions
 PROMPT.md                          how to tune the prompt for your repo
 TROUBLESHOOTING.md                 failure modes, with the fix for each
 ```

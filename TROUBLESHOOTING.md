@@ -1,6 +1,109 @@
 # Troubleshooting
 
-Every failure mode below was seen in production across three repos, not guessed at.
+Every failure mode in the Actions section was seen in production across three repos, not guessed
+at. The local section covers the ones that version can hit.
+
+- [Local](#local)
+- [Actions](#actions)
+- [Both](#both)
+
+# Local
+
+Everything the daemon does goes to one log. Read it first:
+
+```bash
+tail -50 ~/.local/state/claude-pr-review/daemon.log
+```
+
+## Nothing happens at all
+
+Check in this order:
+
+1. **Is the agent loaded?**
+
+   ```bash
+   launchctl list | grep claude-pr-review
+   ```
+
+   Three columns: PID, last exit status, label. No PID between wake-ups is normal. A non-zero exit
+   status is not, and `~/.local/state/claude-pr-review/launchd.err.log` will say why.
+
+2. **Is the repo enabled?** Every repo in the starter config ships with `"enabled": false`.
+
+3. **Is `gh` authenticated?** `gh auth status`. The daemon exits early without it.
+
+4. **Is the PR a draft, or opened by a bot?** Both are skipped by design. Dependabot PRs are never
+   reviewed.
+
+5. **Was it already reviewed at this commit?** The daemon reviews a PR once per head commit.
+
+   ```bash
+   jq . ~/.local/state/claude-pr-review/reviewed.json
+   ```
+
+   Delete an entry to force a re-review, or use `--pr OWNER/REPO#42`, which ignores state.
+
+## It reviewed every open PR at once
+
+`seed_only` was `false` on a repo with a backlog. `max_reviews_per_run` caps each wake-up, so it
+drains a few at a time rather than all at once, but it does drain.
+
+To start from a clean slate, set `"seed_only": true`, let one pass run to record every open PR at
+its current commit, then set it back to `false`. Only new pushes get reviewed after that.
+
+## "no findings file written, nothing posted"
+
+Claude finished without writing its JSON. Usually one of:
+
+- **It hit the timeout.** Look for `claude exited 143` just above. Raise `timeout_seconds`.
+- **It is not logged in.** Run `claude` once by hand and check.
+- **The prompt template got edited** and no longer names the output file. `{{OUTPUT_FILE}}` has to
+  survive in `local/review-prompt.md`.
+
+The state file is not updated on a failure, so the next pass retries the same commit.
+
+## "batch review rejected, falling back to individual comments"
+
+A comment was anchored to a line the diff does not touch, and GitHub rejects the whole review when
+any one comment is invalid. The fallback posts them one at a time and keeps whatever lands, so you
+still get a review. The summary always goes up, and says how many inline comments made it.
+
+An occasional one is normal. Every review doing it means the anchoring rule in the prompt got
+weakened. See [PROMPT.md](PROMPT.md).
+
+## Reviews arrive late, or not until morning
+
+Nothing runs while the Mac is asleep. launchd fires the missed interval on wake, so a PR opened
+overnight gets reviewed when you open the lid.
+
+Because state is keyed on head commit, it reviews the current code rather than replaying every
+commit it missed. Three overnight pushes cost one review, not three.
+
+## Two runs at once
+
+They cannot overlap. The second finds the lock and logs `pass skipped, pid N still running`. That
+line is normal on any repo where a review runs longer than the poll interval.
+
+If the daemon was killed mid-review the lock goes stale, and the next pass clears it after checking
+the pid is gone. No action needed.
+
+## Changing the config does not take effect
+
+The config is read fresh on every wake-up, so edits apply to the next pass with no reload. Editing
+the plist is different: rerun `./local/install.sh` for that.
+
+Check the file parses, since a broken config stops the daemon before it does anything:
+
+```bash
+jq empty ~/.config/claude-pr-review/config.json
+```
+
+## Disk fills up
+
+One clone per repo under `~/.cache/claude-pr-review`. They are blobless, so they are much smaller
+than a normal clone, but they grow as they fetch. Safe to delete any time. The next pass re-clones.
+
+# Actions
 
 ## The check is green but no review was posted
 
@@ -69,37 +172,19 @@ Your gh token lacks the `workflow` scope. Re-auth:
 gh auth refresh -h github.com -s workflow
 ```
 
-## Reviews cost too much
+## Out of Actions minutes
 
-Ordered by how much they save, and how much they cost you:
+Private repos draw from a monthly quota. When it runs out, jobs stop starting: the run appears,
+fails in about 3 seconds, and lists no steps at all. It does not look like a billing problem.
 
-1. **Drop `synchronize` from the trigger list.** One review when the PR opens, none on later
-   pushes. Biggest saving, and you lose review on the code you write after feedback.
-2. **Narrow the branches.** `on.pull_request.branches: [main]` skips PRs into side branches.
-3. **Use a smaller model.** Change `--model` in `claude_args`. It still works and it finds less.
+```bash
+gh api repos/OWNER/REPO/actions/runs/RUN_ID/jobs --jq '.jobs[] | {conclusion, steps}'
+```
 
-Keep `concurrency` with `cancel-in-progress: true` no matter what. Pushing three times in a
-minute otherwise pays for three reviews. In the sample it cancelled 14 runs.
+An empty `steps` array on a failed job is the tell.
 
-## Reviews are too noisy
-
-Expect a lot of `[minor]` and `[improvement]`. That was 87% of findings in the sample. It is the
-design: the prompt tells it to cover the full severity range rather than report only
-high-confidence bugs.
-
-If you want less, tighten the reporting rules in the prompt rather than removing review
-dimensions. You want it looking everywhere and saying less. See [PROMPT.md](PROMPT.md).
-
-The severity tags are there so you can triage. Read critical and major, skim the rest.
-
-## Findings that are wrong
-
-The prompt has an explicit clause requiring verification before reporting. It holds most of the
-time, not always. Treat the output as a careful colleague's first pass, not a verdict.
-
-If you get a wrong finding, check whether the reviewer had the context to know better. Usually it
-did not, and the fix is a line in your `CLAUDE.md` or in the repo-context block of the prompt, not
-a change to the review instructions.
+Public repos have no such limit. For private ones, either move to the local runner or use a
+self-hosted runner. See the README.
 
 ## Two reviews on one PR
 
@@ -120,3 +205,42 @@ gh run list --workflow=claude-code-review.yml --repo OWNER/REPO --limit 20 \
 
 Healthy looks like: mostly `success`, durations between 3 and 15 minutes, some `cancelled` from
 re-pushes. A `success` under a minute is a silent skip.
+
+# Both
+
+## Reviews cost too much
+
+On Actions, ordered by how much they save and how much they cost you:
+
+1. **Drop `synchronize` from the trigger list.** One review when the PR opens, none on later
+   pushes. Biggest saving, and you lose review on the code you write after feedback.
+2. **Narrow the branches.** `on.pull_request.branches: [main]` skips PRs into side branches.
+3. **Use a smaller model.** Change `--model` in `claude_args`. It still works and it finds less.
+
+Keep `concurrency` with `cancel-in-progress: true` no matter what. Pushing three times in a
+minute otherwise pays for three reviews. In the sample it cancelled 14 runs.
+
+Locally there are no runner minutes, only Claude usage. Lower `model` to something smaller, or
+lower `max_reviews_per_run` so a busy day cannot run away from you. The local version already
+avoids the biggest waste on its own: it reviews once per head commit, so three pushes in a minute
+cost one review rather than three.
+
+## Reviews are too noisy
+
+Expect a lot of `[minor]` and `[improvement]`. That was 87% of findings in the sample. It is the
+design: the prompt tells it to cover the full severity range rather than report only
+high-confidence bugs.
+
+If you want less, tighten the reporting rules in the prompt rather than removing review
+dimensions. You want it looking everywhere and saying less. See [PROMPT.md](PROMPT.md).
+
+The severity tags are there so you can triage. Read critical and major, skim the rest.
+
+## Findings that are wrong
+
+The prompt has an explicit clause requiring verification before reporting. It holds most of the
+time, not always. Treat the output as a careful colleague's first pass, not a verdict.
+
+If you get a wrong finding, check whether the reviewer had the context to know better. Usually it
+did not, and the fix is a line in your `CLAUDE.md` or in the repo-context block of the prompt, not
+a change to the review instructions.
