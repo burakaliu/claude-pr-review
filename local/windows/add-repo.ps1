@@ -49,8 +49,17 @@ if (-not (Test-Path $ConfigFile)) { Die "no config at $ConfigFile. Run install.p
 $gh = Get-Command gh.exe -ErrorAction SilentlyContinue
 if (-not $gh) { Die "gh not found on PATH" }
 
+# gh writes to stderr when a repo is missing, and under ErrorActionPreference
+# Stop that becomes a terminating error, so the script dies with a PowerShell
+# stack trace instead of the readable line below. Relax it for this one call
+# and judge the result by the exit code.
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
 & $gh.Source repo view $Repo --json name 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) { Die "cannot reach $Repo with your gh credentials. Check the name and: gh auth status" }
+$ghExit = $LASTEXITCODE
+$ErrorActionPreference = $prevEap
+
+if ($ghExit -ne 0) { Die "cannot reach $Repo with your gh credentials. Check the name and: gh auth status" }
 
 $config = Get-Content $ConfigFile -Raw | ConvertFrom-Json
 if (-not $config.repos) { $config | Add-Member -NotePropertyName repos -NotePropertyValue @() -Force }
