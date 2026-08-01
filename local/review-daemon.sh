@@ -256,15 +256,24 @@ review_pr() {
     return 1
   fi
 
-  local work findings prompt
-  work=$(mktemp -d "${TMPDIR:-/tmp}/claude-pr-review.XXXXXX")
-  findings="$work/findings.json"
+  local findings prompt
+  # The findings file lives inside the checkout, not a temp directory.
+  #
+  # Writing outside the working directory needs a permission a headless run
+  # does not reliably get. When it is refused the reviewer does not fail: it
+  # writes its JSON into the checkout instead and reports where it put it. The
+  # script, watching the temp path, sees nothing and throws away a complete
+  # review that already cost a full model run. Observed on a real pull request.
+  #
+  # Writing into the working directory always works, and prepare_checkout runs
+  # git clean, so the file never survives into the next pass.
+  findings="$dir/.pr-review-findings.json"
+  rm -f "$findings"
 
-  # The script keeps reading and writing $findings in POSIX form; claude is
-  # told the native form of the same file.
-  local findings_native work_native
+  # The script reads $findings in POSIX form; claude is told the native form of
+  # the same file.
+  local findings_native
   findings_native=$(to_native "$findings")
-  work_native=$(to_native "$work")
 
   prompt=$(sed \
     -e "s|{{REPO}}|$repo|g" \
@@ -289,7 +298,6 @@ review_pr() {
       claude -p "$prompt" \
       --model "$MODEL" \
       --permission-mode acceptEdits \
-      --add-dir "$work_native" \
       --allowedTools "Read,Grep,Glob,Write,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*)" \
       </dev/null >>"$LOG" 2>&1
   ) || rc=$?
@@ -300,18 +308,18 @@ review_pr() {
 
   if [ ! -s "$findings" ]; then
     log "  no findings file written, nothing posted"
-    rm -rf "$work"
+    rm -f "$findings"
     return 1
   fi
 
   if ! jq empty "$findings" 2>/dev/null; then
     log "  findings file is not valid JSON, nothing posted"
-    rm -rf "$work"
+    rm -f "$findings"
     return 1
   fi
 
   post_review "$repo" "$pr" "$sha" "$findings"
-  rm -rf "$work"
+  rm -f "$findings"
   return 0
 }
 
