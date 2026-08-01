@@ -1,0 +1,14 @@
+# Git for Windows installs with core.autocrlf=true, which rewrites line endings
+# on checkout. A shell script that picks up CRLF that way does not run: bash
+# reads the trailing carriage return as part of the command and fails with
+# `$'\r': command not found`. Pin the endings per type so a clone behaves the
+# same on either platform.
+
+* text=auto eol=lf
+
+*.sh text eol=lf
+*.plist text eol=lf
+
+# Native Windows tooling expects CRLF, and nothing here reads these from bash.
+*.ps1 text eol=crlf
+*.vbs text eol=crlf

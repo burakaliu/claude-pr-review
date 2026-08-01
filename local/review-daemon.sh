@@ -78,6 +78,20 @@ run_with_timeout() {
   return "$rc"
 }
 
+# Under Git Bash on Windows the claude CLI is a native Windows binary, so it
+# cannot resolve the POSIX paths this script works in: it reads /tmp/x as
+# drive-relative and writes to D:\tmp\x instead. Every path handed to claude,
+# whether on the command line or embedded in the prompt body, goes through here
+# first. Elsewhere cygpath does not exist and paths are already native, so this
+# returns them untouched.
+to_native() {
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -m "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+
 acquire_lock() {
   if ! mkdir "$LOCK" 2>/dev/null; then
     local other=""
@@ -124,6 +138,10 @@ prepare_checkout() {
     rm -rf "$dir"
     gh repo clone "$repo" "$dir" -- --filter=blob:none --no-checkout >>"$LOG" 2>&1 \
       || return 1
+    # Windows still refuses paths past 260 characters unless asked otherwise,
+    # which a deep node_modules-style tree in a checkout can cross. A no-op
+    # everywhere else.
+    git -C "$dir" config core.longpaths true >>"$LOG" 2>&1 || true
   fi
 
   git -C "$dir" fetch origin --prune --quiet >>"$LOG" 2>&1 || return 1
@@ -242,11 +260,17 @@ review_pr() {
   work=$(mktemp -d "${TMPDIR:-/tmp}/claude-pr-review.XXXXXX")
   findings="$work/findings.json"
 
+  # The script keeps reading and writing $findings in POSIX form; claude is
+  # told the native form of the same file.
+  local findings_native work_native
+  findings_native=$(to_native "$findings")
+  work_native=$(to_native "$work")
+
   prompt=$(sed \
     -e "s|{{REPO}}|$repo|g" \
     -e "s|{{PR_NUMBER}}|$pr|g" \
     -e "s|{{HEAD_SHA}}|$sha|g" \
-    -e "s|{{OUTPUT_FILE}}|$findings|g" \
+    -e "s|{{OUTPUT_FILE}}|$findings_native|g" \
     "$PROMPT_TEMPLATE")
   # Free-text fields go through the environment so their contents cannot be
   # read as sed replacement syntax.
@@ -258,13 +282,16 @@ review_pr() {
   local rc=0
   (
     cd "$dir" || exit 1
+    # stdin is closed explicitly: with no console attached, as under a Windows
+    # scheduled task or launchd, claude otherwise stalls waiting on a handle
+    # that will never carry data.
     run_with_timeout "$TIMEOUT_SECONDS" \
       claude -p "$prompt" \
       --model "$MODEL" \
       --permission-mode acceptEdits \
-      --add-dir "$work" \
+      --add-dir "$work_native" \
       --allowedTools "Read,Grep,Glob,Write,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*)" \
-      >>"$LOG" 2>&1
+      </dev/null >>"$LOG" 2>&1
   ) || rc=$?
 
   if [ "$rc" -ne 0 ]; then
