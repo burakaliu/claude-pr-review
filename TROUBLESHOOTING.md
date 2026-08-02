@@ -4,6 +4,7 @@ Every failure mode in the Actions section was seen in production across three re
 at. The local section covers the ones that version can hit.
 
 - [Local](#local)
+- [Windows](#windows)
 - [Actions](#actions)
 - [Both](#both)
 
@@ -102,6 +103,98 @@ jq empty ~/.config/claude-pr-review/config.json
 
 One clone per repo under `~/.cache/claude-pr-review`. They are blobless, so they are much smaller
 than a normal clone, but they grow as they fetch. Safe to delete any time. The next pass re-clones.
+
+# Windows
+
+The Local section above applies too. These are the ones specific to running under Task Scheduler
+and Git Bash. Read the log the same way:
+
+```powershell
+Get-Content "$HOME\.local\state\claude-pr-review\daemon.log" -Tail 50
+```
+
+## Every review logs "no findings file written", forever
+
+The one Windows failure that looks like a Claude problem and is not. `claude` is a native Windows
+binary and cannot resolve the POSIX paths the daemon works in. Told to write
+`/tmp/claude-pr-review.abc/findings.json`, it reads that as drive-relative and writes
+`D:\tmp\claude-pr-review.abc\findings.json`. The script then looks in the real temp directory,
+finds nothing, and posts nothing. Every review burns its full runtime first.
+
+Check for the giveaway:
+
+```powershell
+Get-ChildItem D:\tmp, C:\tmp -ErrorAction SilentlyContinue
+```
+
+A `claude-pr-review.*` directory at a drive root means the daemon is missing the `to_native`
+conversion. Pull the current `local/review-daemon.sh`.
+
+## Nothing runs, and the task shows no next run time
+
+```powershell
+Get-ScheduledTaskInfo -TaskName claude-pr-review | Select-Object LastRunTime, LastTaskResult, NextRunTime
+```
+
+An empty `NextRunTime` on a task that registered fine means it has only a logon trigger, and you
+were already logged in when it was registered. It will sit there until the next logon. The
+installer registers a time trigger alongside the logon one for exactly this reason; re-running
+`install.ps1` fixes a hand-built task.
+
+`LastTaskResult` of `267011` is not an error. It is "has not yet run".
+
+## The task runs, but the log says claude or gh is not found
+
+The task is running WSL's bash instead of Git's. `bash.exe` on PATH is
+`C:\Windows\System32\bash.exe` on a default Windows 11 install, and the Windows-side `gh`, `jq`,
+and `claude` are not on its PATH.
+
+Check what the task actually calls:
+
+```powershell
+(Get-ScheduledTask -TaskName claude-pr-review).Actions.Arguments
+```
+
+The second quoted path must be a Git Bash, typically `C:\Program Files\Git\bin\bash.exe`. Re-run
+`install.ps1`, which finds it from where `git.exe` is installed rather than trusting PATH.
+
+## perl, sed, or mktemp not found
+
+The daemon was launched without a login shell, so `/usr/bin` is missing from PATH. The launcher
+runs `bash -l`. If you are invoking the script yourself, do the same:
+
+```powershell
+& 'C:\Program Files\Git\bin\bash.exe' -l local\review-daemon.sh --dry-run --pr OWNER/REPO#42
+```
+
+## A console window flashes every five minutes
+
+The task is pointed straight at `bash.exe`. Task Scheduler has no setting that reliably suppresses
+that window. The action should be `wscript.exe` running `local\windows\run-daemon.vbs`, which shows
+nothing. Re-run `install.ps1`.
+
+If your environment blocks Windows Script Host, point the task at `bash.exe` and accept the flash,
+or set the task to run whether or not you are logged on, which hides it at the cost of storing your
+password.
+
+## It stops running after a reboot
+
+The task runs with an interactive token, so it needs you logged in. That is what lets `gh` reach
+the Windows credential store without a stored password. After a reboot it resumes at your next
+logon, and the logon trigger runs a pass immediately rather than waiting out the interval.
+
+If the machine must review while logged out, change the principal to run whether or not the user is
+logged on, and expect to re-authenticate `gh` with a token in the environment rather than the
+keyring.
+
+## Checking it is alive
+
+```powershell
+Get-ScheduledTaskInfo -TaskName claude-pr-review | Select-Object LastRunTime, LastTaskResult, NextRunTime
+Get-Content "$HOME\.local\state\claude-pr-review\daemon.log" -Tail 20
+```
+
+A healthy idle machine logs `pass complete, 0 review(s) run` on every wake-up.
 
 # Actions
 
